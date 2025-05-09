@@ -238,13 +238,12 @@ public:
     // load sstable using components shared by a shard
     future<> load(foreign_sstable_open_info info) noexcept;
     // Load metadata components from disk
-    future<> load_metadata(sstable_open_config cfg = {}, bool validate = true) noexcept;
+    future<> load_metadata(sstable_open_config cfg = {}) noexcept;
     // load all components from disk
     // this variant will be useful for testing purposes and also when loading
     // a new sstable from scratch for sharing its components.
     future<> load(const dht::sharder& sharder, sstable_open_config cfg = {}) noexcept;
     future<> open_data(sstable_open_config cfg = {}) noexcept;
-    future<> update_info_for_opened_data(sstable_open_config cfg = {});
 
     // Load set of shards that own the SSTable, while reading the minimum
     // from disk to achieve that.
@@ -664,6 +663,8 @@ private:
     // filter initialisation was not good.
     // This should be called only before an sstable is sealed.
     void maybe_rebuild_filter_from_index(uint64_t num_partitions);
+
+    future<> update_info_for_opened_data(sstable_open_config cfg = {});
 
     future<> read_toc() noexcept;
     future<> read_summary() noexcept;

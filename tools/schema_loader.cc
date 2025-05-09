@@ -396,7 +396,7 @@ schema_ptr do_load_schema_from_schema_tables(const db::config& dbcfg, std::files
     reader_concurrency_semaphore rcs_sem(reader_concurrency_semaphore::no_limits{}, __FUNCTION__, reader_concurrency_semaphore::register_metrics::no);
     auto stop_semaphore = deferred_stop(rcs_sem);
 
-    auto scf = make_sstable_compressor_factory();
+    auto scf = make_sstable_compressor_factory_for_tests_in_thread();
     sharded<sstable_manager_service> sst_man;
     sst_man.start(std::ref(dbcfg), std::ref(*scf)).get();
     auto stop_sst_man_service = deferred_stop(sst_man);
@@ -500,7 +500,7 @@ schema_ptr do_load_schema_from_sstable(const db::config& dbcfg, std::filesystem:
     cache_tracker tracker;
     sstables::directory_semaphore dir_sem(1);
     abort_source abort;
-    auto scf = make_sstable_compressor_factory();
+    auto scf = make_sstable_compressor_factory_for_tests_in_thread();
     sstables::sstables_manager sst_man("tools::load_schema_from_sstable", large_data_handler, dbcfg, feature_service, tracker,
         memory::stats().total_memory(), dir_sem,
         [host_id = locator::host_id::create_random_id()] { return host_id; }, *scf, abort);
@@ -513,7 +513,7 @@ schema_ptr do_load_schema_from_sstable(const db::config& dbcfg, std::filesystem:
     auto local = data_dictionary::make_local_options(dir_path);
     auto bootstrap_sst = sst_man.make_sstable(bootstrap_schema, local, ed.generation, sstables::sstable_state::normal, ed.version, ed.format);
 
-    bootstrap_sst->load_metadata({}, false).get();
+    bootstrap_sst->load_metadata().get();
 
     const auto& serialization_header = bootstrap_sst->get_serialization_header();
     const auto& compression = bootstrap_sst->get_compression();
