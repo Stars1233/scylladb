@@ -221,6 +221,18 @@ std::optional<tablet_replica> get_leaving_replica(const tablet_info& tinfo, cons
     return *leaving.begin();
 }
 
+bool is_post_cleanup(tablet_replica replica, const tablet_info& tinfo, const tablet_transition_info& trinfo) {
+    if (replica == locator::get_leaving_replica(tinfo, trinfo)) {
+        // we do tablet cleanup on the leaving replica in the `cleanup` stage, after which there is only the `end_migration` stage.
+        return trinfo.stage == locator::tablet_transition_stage::end_migration;
+    }
+    if (replica == trinfo.pending_replica) {
+        // we do tablet cleanup on the pending replica in the `cleanup_target` stage, after which there is only the `revert_migration` stage.
+        return trinfo.stage == locator::tablet_transition_stage::revert_migration;
+    }
+    return false;
+}
+
 tablet_replica_set get_new_replicas(const tablet_info& tinfo, const tablet_migration_info& mig) {
     return replace_replica(tinfo.replicas, mig.src, mig.dst);
 }
@@ -425,6 +437,14 @@ std::optional<tablet_replica> maybe_get_primary_replica(tablet_id id, const tabl
 tablet_replica tablet_map::get_primary_replica(tablet_id id) const {
     const auto& replicas = get_tablet_info(id).replicas;
     return replicas.at(size_t(id) % replicas.size());
+}
+
+tablet_replica tablet_map::get_secondary_replica(tablet_id id) const {
+    if (get_tablet_info(id).replicas.size() < 2) {
+        throw std::runtime_error(format("No secondary replica for tablet id {}", id));
+    }
+    const auto& replicas = get_tablet_info(id).replicas;
+    return replicas.at((size_t(id)+1) % replicas.size());
 }
 
 tablet_replica tablet_map::get_primary_replica_within_dc(tablet_id id, const topology& topo, sstring dc) const {

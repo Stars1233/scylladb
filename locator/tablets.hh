@@ -291,6 +291,10 @@ struct tablet_transition_info {
 // Returns the leaving replica for a given transition.
 std::optional<tablet_replica> get_leaving_replica(const tablet_info&, const tablet_transition_info&);
 
+// True if the tablet is transitioning and it's in a stage that follows the stage
+// where we clean up the tablet on the given replica.
+bool is_post_cleanup(tablet_replica replica, const tablet_info& tinfo, const tablet_transition_info& trinfo);
+
 /// Represents intention to move a single tablet replica from src to dst.
 struct tablet_migration_info {
     locator::tablet_transition_kind kind;
@@ -498,6 +502,10 @@ public:
     /// Returns the primary replica for the tablet
     tablet_replica get_primary_replica(tablet_id id) const;
     tablet_replica get_primary_replica_within_dc(tablet_id id, const topology& topo, sstring dc) const;
+
+    /// Returns the secondary replica for the tablet, which is assumed to be directly following the primary replica in the replicas vector
+    /// \throws std::runtime_error if the tablet has less than 2 replicas.
+    tablet_replica get_secondary_replica(tablet_id id) const;
 
     // Returns the replica that matches hosts and dcs filters for tablet_task_info.
     std::optional<tablet_replica> maybe_get_selected_replica(tablet_id id, const topology& topo, const tablet_task_info& tablet_task_info) const;

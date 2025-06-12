@@ -167,13 +167,13 @@ distributed_loader::make_sstables_available(sstables::sstable_directory& dir, sh
 }
 
 future<>
-distributed_loader::process_upload_dir(distributed<replica::database>& db, sharded<db::view::view_builder>& vb, sstring ks, sstring cf, bool skip_cleanup) {
+distributed_loader::process_upload_dir(distributed<replica::database>& db, sharded<db::view::view_builder>& vb, sstring ks, sstring cf, bool skip_cleanup, bool skip_reshape) {
     const auto& rs = db.local().find_keyspace(ks).get_replication_strategy();
     if (rs.is_per_table()) {
         on_internal_error(dblog, "process_upload_dir is not supported with tablets");
     }
 
-    return seastar::async([&db, &vb, ks = std::move(ks), cf = std::move(cf), skip_cleanup] {
+    return seastar::async([&db, &vb, ks = std::move(ks), cf = std::move(cf), skip_cleanup, skip_reshape] {
         auto global_table = get_table_on_all_shards(db, ks, cf).get();
 
         sharded<sstables::sstable_directory> directory;
@@ -204,7 +204,7 @@ distributed_loader::process_upload_dir(distributed<replica::database>& db, shard
             }).get();
             return sstm.make_sstable(global_table->schema(), global_table->get_storage_options(),
                                      generation, sstables::sstable_state::upload, sstm.get_highest_supported_format(),
-                                     sstables::sstable_format_types::big, gc_clock::now(), &error_handler_gen_for_upload_dir);
+                                     sstables::sstable_format_types::big, db_clock::now(), &error_handler_gen_for_upload_dir);
         };
         // Pass owned_ranges_ptr to reshard to piggy-back cleanup on the resharding compaction.
         // Note that needs_cleanup() is inaccurate and may return false positives,
@@ -219,8 +219,10 @@ distributed_loader::process_upload_dir(distributed<replica::database>& db, shard
         const auto& erm = db.local().find_keyspace(ks).get_vnode_effective_replication_map();
         auto owned_ranges_ptr = skip_cleanup ? lw_shared_ptr<dht::token_range_vector>(nullptr) : compaction::make_owned_ranges_ptr(db.local().get_keyspace_local_ranges(erm).get());
         reshard(directory, db, ks, cf, make_sstable, owned_ranges_ptr).get();
-        reshape(directory, db, sstables::reshape_mode::strict, ks, cf, make_sstable,
-                [] (const sstables::shared_sstable&) { return true; }).get();
+        if (!skip_reshape) {
+            reshape(directory, db, sstables::reshape_mode::strict, ks, cf, make_sstable,
+                    [] (const sstables::shared_sstable&) { return true; }).get();
+        }
 
         // Move to staging directory to avoid clashes with future uploads. Unique generation number ensures no collisions.
         const bool use_view_update_path = db::view::check_needs_view_update_path(vb.local(), erm->get_token_metadata_ptr(), *global_table, streaming::stream_reason::repair).get();
