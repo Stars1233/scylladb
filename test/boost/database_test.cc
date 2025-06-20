@@ -1615,7 +1615,7 @@ SEASTAR_TEST_CASE(test_disk_space_monitor_capacity_override) {
             .free = 12,
             .available = 11,
         };
-        monitor.set_space_source([&] { return make_ready_future<std::filesystem::space_info>(orig_space); });
+        auto reg = monitor.set_space_source([&] { return make_ready_future<std::filesystem::space_info>(orig_space); });
 
         utils::phased_barrier poll_barrier("poll_barrier"); // new operation started whenever monitor calls listeners.
         auto op = poll_barrier.start();
@@ -1654,6 +1654,16 @@ SEASTAR_TEST_CASE(test_disk_space_monitor_capacity_override) {
         monitor.trigger_poll();
         poll_barrier.advance_and_await().get();
         BOOST_REQUIRE(monitor.space() == orig_space);
+    });
+}
+
+SEASTAR_TEST_CASE(enable_drained_compaction_manager) {
+    return do_with_cql_env_thread([] (cql_test_env& e) {
+        e.db().invoke_on_all([] (replica::database& db) -> future<> {
+            auto& cm = db.get_compaction_manager();
+            co_await cm.drain();
+            cm.enable();
+        }).get();
     });
 }
 

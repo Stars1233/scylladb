@@ -832,12 +832,19 @@ public:
         auto local_replica = locator::tablet_replica{_my_host_id, this_shard_id()};
 
         for (auto tid : tmap.tablet_ids()) {
-            auto range = tmap.get_token_range(tid);
-
-            if (tmap.has_replica(tid, local_replica)) {
-                tlogger.debug("Tablet with id {} and range {} present for {}.{}", tid, range, schema()->ks_name(), schema()->cf_name());
-                ret[tid.value()] = allocate_storage_group(tmap, tid, std::move(range));
+            if (!tmap.has_replica(tid, local_replica)) {
+                continue;
             }
+
+            // if the tablet was cleaned up already on this replica, don't allocate a storage group for it.
+            auto trinfo = tmap.get_tablet_transition_info(tid);
+            if (trinfo && locator::is_post_cleanup(local_replica, tmap.get_tablet_info(tid), *trinfo)) {
+                continue;
+            }
+
+            auto range = tmap.get_token_range(tid);
+            tlogger.debug("Tablet with id {} and range {} present for {}.{}", tid, range, schema()->ks_name(), schema()->cf_name());
+            ret[tid.value()] = allocate_storage_group(tmap, tid, std::move(range));
         }
         _storage_groups = std::move(ret);
     }
@@ -2713,7 +2720,7 @@ void tablet_storage_group_manager::update_effective_replication_map(const locato
         handle_tablet_merge_completion(*old_tablet_map, *new_tablet_map);
     }
 
-    // Allocate storage group if tablet is migrating in.
+    // Allocate storage group if tablet is migrating in, or deallocate if it's migrating out.
     auto this_replica = locator::tablet_replica{
         .host = erm.get_token_metadata().get_my_id(),
         .shard = this_shard_id()
@@ -2729,6 +2736,8 @@ void tablet_storage_group_manager::update_effective_replication_map(const locato
             auto range = new_tablet_map->get_token_range(tid);
             _storage_groups[tid.value()] = allocate_storage_group(*new_tablet_map, tid, std::move(range));
             tablet_migrating_in = true;
+        } else if (_storage_groups.contains(tid.value()) && locator::is_post_cleanup(this_replica, new_tablet_map->get_tablet_info(tid), transition_info)) {
+            remove_storage_group(tid.value());
         }
     }
 
@@ -2941,11 +2950,13 @@ future<> table::snapshot_on_all_shards(sharded<database>& sharded_db, const glob
         std::vector<table::snapshot_file_set> file_sets;
         file_sets.reserve(smp::count);
 
+        co_await io_check([&jsondir] { return recursive_touch_directory(jsondir); });
         co_await coroutine::parallel_for_each(smp::all_cpus(), [&] (unsigned shard) -> future<> {
             file_sets.emplace_back(co_await smp::submit_to(shard, [&] {
                 return table_shards->take_snapshot(jsondir);
             }));
         });
+        co_await io_check(sync_directory, jsondir);
 
         co_await t.finalize_snapshot(sharded_db.local(), std::move(jsondir), std::move(file_sets));
     });
@@ -2959,14 +2970,12 @@ future<table::snapshot_file_set> table::take_snapshot(sstring jsondir) {
     auto tables = *_sstables->all() | std::ranges::to<std::vector<sstables::shared_sstable>>();
     auto table_names = std::make_unique<std::unordered_set<sstring>>();
 
-    co_await io_check([&jsondir] { return recursive_touch_directory(jsondir); });
     co_await _sstables_manager.dir_semaphore().parallel_for_each(tables, [&jsondir, &table_names] (sstables::shared_sstable sstable) {
         table_names->insert(sstable->component_basename(sstables::component_type::Data));
         return io_check([sstable, &dir = jsondir] {
             return sstable->snapshot(dir);
         });
     });
-    co_await io_check(sync_directory, jsondir);
     co_return make_foreign(std::move(table_names));
 }
 
@@ -3192,7 +3201,6 @@ future<db::replay_position> table::discard_sstables(db_clock::time_point truncat
     co_await _cache.invalidate(row_cache::external_updater([this, &rp, &remove, truncated_at] {
         // FIXME: the following isn't exception safe.
         for_each_compaction_group([&] (compaction_group& cg) {
-            auto gc_trunc = to_gc_clock(truncated_at);
 
             auto pruned = make_lw_shared<sstables::sstable_set>(cg.make_main_sstable_set());
             auto maintenance_pruned = cg.make_maintenance_sstable_set();
@@ -3201,7 +3209,7 @@ future<db::replay_position> table::discard_sstables(db_clock::time_point truncat
                                             const lw_shared_ptr<sstables::sstable_set>& pruning,
                                             replica::enable_backlog_tracker enable_backlog_tracker) mutable {
                 pruning->for_each_sstable([&] (const sstables::shared_sstable& p) mutable {
-                    if (p->max_data_age() <= gc_trunc) {
+                    if (p->max_data_age() <= truncated_at) {
                         if (p->originated_on_this_node().value_or(false) && p->get_stats_metadata().position.shard_id() == this_shard_id()) {
                             rp = std::max(p->get_stats_metadata().position, rp);
                         }
@@ -4129,7 +4137,6 @@ future<> table::cleanup_tablet(database& db, db::system_keyspace& sys_ks, locato
     co_await stop_compaction_groups(sg);
     co_await utils::get_local_injector().inject("delay_tablet_compaction_groups_cleanup", std::chrono::seconds(5));
     co_await cleanup_compaction_groups(db, sys_ks, tid, sg);
-    _sg_manager->remove_storage_group(tid.value());
 }
 
 future<> table::cleanup_tablet_without_deallocation(database& db, db::system_keyspace& sys_ks, locator::tablet_id tid) {

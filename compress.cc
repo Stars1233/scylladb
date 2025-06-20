@@ -536,11 +536,15 @@ compression_parameters::compression_parameters(const std::map<sstring, sstring>&
     }
 }
 
-void compression_parameters::validate(const gms::feature_service& fs) {
-    if (!fs.sstable_compression_dicts) {
-        if (_algorithm == algorithm::zstd_with_dicts || _algorithm == algorithm::lz4_with_dicts) {
+void compression_parameters::validate(dicts_feature_enabled dicts_enabled, dicts_usage_allowed dicts_allowed) {
+    if (_algorithm == algorithm::zstd_with_dicts || _algorithm == algorithm::lz4_with_dicts) {
+        if (!dicts_enabled) {
             throw std::runtime_error(std::format("sstable_compression {} can't be used before "
                                                  "all nodes are upgraded to a versions which supports it",
+                                                 algorithm_to_name(_algorithm)));
+        }
+        if (!dicts_allowed) {
+            throw std::runtime_error(std::format("sstable_compression {} has been disabled by `sstable_compression_dictionaries_allow_in_ddl: false`",
                                                  algorithm_to_name(_algorithm)));
         }
     }
@@ -768,6 +772,8 @@ size_t snappy_processor::uncompress(const char* input, size_t input_len,
 
 size_t snappy_processor::compress(const char* input, size_t input_len,
                 char* output, size_t output_len) const {
+    // FIXME: snappy internally performs allocations greater than 128 kiB.
+    const memory::scoped_large_allocation_warning_threshold slawt{256*1024};
     auto ret = snappy_compress(input, input_len, output, &output_len);
     if (ret != SNAPPY_OK) {
         throw std::runtime_error("snappy compression failure: snappy_compress() failed");

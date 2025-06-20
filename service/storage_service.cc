@@ -817,6 +817,10 @@ future<> storage_service::topology_state_load(state_change_hint hint) {
 
     for (const auto& gen_id : _topology_state_machine._topology.committed_cdc_generations) {
         rtlogger.trace("topology_state_load: process committed cdc generation {}", gen_id);
+        co_await utils::get_local_injector().inject("topology_state_load_before_update_cdc", [](auto& handler) -> future<> {
+            rtlogger.info("topology_state_load_before_update_cdc hit, wait for message");
+            co_await handler.wait_for_message(db::timeout_clock::now() + std::chrono::minutes(5));
+        });
         co_await _cdc_gens.local().handle_cdc_generation(gen_id);
         if (gen_id == _topology_state_machine._topology.committed_cdc_generations.back()) {
             co_await _sys_ks.local().update_cdc_generation_id(gen_id);
@@ -4697,9 +4701,17 @@ future<> storage_service::drain() {
 }
 
 future<> storage_service::do_drain() {
+    // Need to stop transport before group0, otherwise RPCs may fail with raft_group_not_found.
     co_await stop_transport();
 
+    // group0 persistence relies on local storage, so we need to stop group0 first.
+    // This must be kept in sync with defer_verbose_shutdown for group0 in main.cc to
+    // handle the case when initialization fails before reaching drain_on_shutdown for ss.
+    _sl_controller.local().abort_group0_operations();
     co_await wait_for_group0_stop();
+    if (_group0) {
+        co_await _group0->abort();
+    }
 
     co_await tracing::tracing::tracing_instance().invoke_on_all(&tracing::tracing::shutdown);
 
@@ -5373,7 +5385,7 @@ future<> storage_service::move(token new_token) {
     });
 }
 
-future<std::vector<storage_service::token_range_endpoints>>
+future<utils::chunked_vector<storage_service::token_range_endpoints>>
 storage_service::describe_ring(const sstring& keyspace, bool include_only_local_dc) const {
     if (_db.local().find_keyspace(keyspace).uses_tablets()) {
         throw std::runtime_error(fmt::format("The keyspace {} has tablet table. Query describe_ring with the table parameter!", keyspace));
@@ -5381,7 +5393,7 @@ storage_service::describe_ring(const sstring& keyspace, bool include_only_local_
     co_return co_await locator::describe_ring(_db.local(), _gossiper, keyspace, include_only_local_dc);
 }
 
-future<std::vector<dht::token_range_endpoints>>
+future<utils::chunked_vector<dht::token_range_endpoints>>
 storage_service::describe_ring_for_table(const sstring& keyspace_name, const sstring& table_name) const {
     slogger.debug("describe_ring for table {}.{}", keyspace_name, table_name);
     auto& t = _db.local().find_column_family(keyspace_name, table_name);
@@ -5393,7 +5405,7 @@ storage_service::describe_ring_for_table(const sstring& keyspace_name, const sst
     auto erm = t.get_effective_replication_map();
     auto& tmap = erm->get_token_metadata_ptr()->tablets().get_tablet_map(tid);
     const auto& topology = erm->get_topology();
-    std::vector<dht::token_range_endpoints> ranges;
+    utils::chunked_vector<dht::token_range_endpoints> ranges;
     co_await tmap.for_each_tablet([&] (locator::tablet_id id, const locator::tablet_info& info) -> future<> {
         auto range = tmap.get_token_range(id);
         auto& replicas = info.replicas;
@@ -6147,7 +6159,7 @@ future<> storage_service::clone_locally_tablet_storage(locator::global_tablet_id
     auto load_sstable = [] (const dht::sharder& sharder, replica::table& t, sstables::entry_descriptor d) -> future<sstables::shared_sstable> {
         auto& mng = t.get_sstables_manager();
         auto sst = mng.make_sstable(t.schema(), t.get_storage_options(), d.generation, d.state.value_or(sstables::sstable_state::normal),
-                                    d.version, d.format, gc_clock::now(), default_io_error_handler_gen());
+                                    d.version, d.format, db_clock::now(), default_io_error_handler_gen());
         // The loader will consider current shard as sstable owner, despite the tablet sharder
         // will still point to leaving replica at this stage in migration. If node goes down,
         // SSTables will be loaded at pending replica and migration is retried, so correctness
@@ -7511,7 +7523,7 @@ storage_service::get_splits(const sstring& ks_name, const sstring& cf_name, wrap
     } else {
         unwrapped.emplace_back(std::move(range));
     }
-    tokens.push_back(std::move(unwrapped[0].start().value_or(range_type::bound(dht::minimum_token()))).value());
+    tokens.push_back(std::move(unwrapped[0].start_copy().value_or(range_type::bound(dht::minimum_token()))).value());
     for (auto&& r : unwrapped) {
         std::vector<dht::token> range_tokens;
         for (auto &&sst : *sstables) {
@@ -7522,7 +7534,7 @@ storage_service::get_splits(const sstring& ks_name, const sstring& cf_name, wrap
         std::sort(range_tokens.begin(), range_tokens.end());
         std::move(range_tokens.begin(), range_tokens.end(), std::back_inserter(tokens));
     }
-    tokens.push_back(std::move(unwrapped[unwrapped.size() - 1].end().value_or(range_type::bound(dht::maximum_token()))).value());
+    tokens.push_back(std::move(unwrapped[unwrapped.size() - 1].end_copy().value_or(range_type::bound(dht::maximum_token()))).value());
 
     // split_count should be much smaller than number of key samples, to avoid huge sampling error
     constexpr uint32_t min_samples_per_split = 4;
